@@ -1,20 +1,26 @@
-# Copyright (c) 2017-present, Facebook, Inc.
+# Original work Copyright (c) 2017-present, Facebook, Inc.
+# Modified work Copyright (c) 2018, Xilun Chen
 # All rights reserved.
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 #
 
+import itertools
 import os
 from logging import getLogger
+import random
+
+import numpy as np
 import scipy
 import scipy.linalg
 import torch
 from torch.autograd import Variable
 from torch.nn import functional as F
+from torch import optim
 
 from .utils import get_optimizer, load_embeddings, normalize_embeddings, export_embeddings
-from .utils import clip_parameters
+from .utils import clip_parameters, apply_mapping
 from .dico_builder import build_dictionary
 from .evaluation.word_translation import DIC_EVAL_PATH, load_identical_char_dico, load_dictionary
 
@@ -24,84 +30,130 @@ logger = getLogger()
 
 class Trainer(object):
 
-    def __init__(self, src_emb, tgt_emb, mapping, discriminator, params):
+    def __init__(self, embs, mappings, discriminators, params):
         """
         Initialize trainer script.
         """
-        self.src_emb = src_emb
-        self.tgt_emb = tgt_emb
-        self.src_dico = params.src_dico
-        self.tgt_dico = getattr(params, 'tgt_dico', None)
-        self.mapping = mapping
-        self.discriminator = discriminator
+        self.embs = embs
+        self.vocabs = params.vocabs
+        self.mappings = mappings
+        self.discriminators = discriminators
         self.params = params
+        self.dicos = {}
 
         # optimizers
         if hasattr(params, 'map_optimizer'):
             optim_fn, optim_params = get_optimizer(params.map_optimizer)
-            self.map_optimizer = optim_fn(mapping.parameters(), **optim_params)
+            self.map_optimizer = optim_fn(itertools.chain(*[m.parameters()
+                for l,m in mappings.items() if l!=params.tgt_lang]), **optim_params)
         if hasattr(params, 'dis_optimizer'):
             optim_fn, optim_params = get_optimizer(params.dis_optimizer)
-            self.dis_optimizer = optim_fn(discriminator.parameters(), **optim_params)
+            self.dis_optimizer = optim_fn(itertools.chain(*[d.parameters()
+                for d in discriminators.values()]), **optim_params)
         else:
-            assert discriminator is None
+            assert discriminators is None
+        if hasattr(params, 'mpsr_optimizer'):
+            optim_fn, optim_params = get_optimizer(params.mpsr_optimizer)
+            self.mpsr_optimizer = optim_fn(itertools.chain(*[m.parameters()
+                for l,m in self.mappings.items() if l!=self.params.tgt_lang]), **optim_params)
 
         # best validation score
         self.best_valid_metric = -1e12
 
         self.decrease_lr = False
 
-    def get_dis_xy(self, volatile):
+    def get_dis_xy(self, lang1, lang2, volatile):
         """
         Get discriminator input batch / output target.
+        Encode from lang1, decode to lang2 and then discriminate
         """
         # select random word IDs
         bs = self.params.batch_size
         mf = self.params.dis_most_frequent
-        assert mf <= min(len(self.src_dico), len(self.tgt_dico))
-        src_ids = torch.LongTensor(bs).random_(len(self.src_dico) if mf == 0 else mf)
-        tgt_ids = torch.LongTensor(bs).random_(len(self.tgt_dico) if mf == 0 else mf)
+        assert mf <= min(map(len, self.vocabs.values()))
+        src_ids = torch.LongTensor(bs).random_(len(self.vocabs[lang1]) if mf == 0 else mf)
+        tgt_ids = torch.LongTensor(bs).random_(len(self.vocabs[lang2]) if mf == 0 else mf)
         if self.params.cuda:
             src_ids = src_ids.cuda()
             tgt_ids = tgt_ids.cuda()
 
         # get word embeddings
-        src_emb = self.src_emb(Variable(src_ids, volatile=True))
-        tgt_emb = self.tgt_emb(Variable(tgt_ids, volatile=True))
-        src_emb = self.mapping(Variable(src_emb.data, volatile=volatile))
+        src_emb = self.embs[lang1](Variable(src_ids, volatile=True))
+        tgt_emb = self.embs[lang2](Variable(tgt_ids, volatile=True))
         tgt_emb = Variable(tgt_emb.data, volatile=volatile)
+        # map
+        src_emb = self.mappings[lang1](Variable(src_emb.data, volatile=volatile))
+        # decode
+        src_emb = F.linear(src_emb, self.mappings[lang2].weight.t())
 
         # input / target
         x = torch.cat([src_emb, tgt_emb], 0)
         y = torch.FloatTensor(2 * bs).zero_()
+        # 0 indicates real (lang2) samples
         y[:bs] = 1 - self.params.dis_smooth
         y[bs:] = self.params.dis_smooth
         y = Variable(y.cuda() if self.params.cuda else y)
 
         return x, y
 
+    def get_mpsr_xy(self, lang1, lang2, volatile):
+        """
+        Get input batch / output target for MPSR.
+        """
+        # select random word IDs
+        bs = self.params.batch_size
+        dico = self.dicos[(lang1, lang2)]
+        indices = torch.from_numpy(np.random.randint(0, len(dico), bs))
+        if self.params.cuda:
+            indices = indices.cuda()
+        dico = dico.index_select(0, indices)
+        src_ids = dico[:, 0]
+        tgt_ids = dico[:, 1]
+        if self.params.cuda:
+            src_ids = src_ids.cuda()
+            tgt_ids = tgt_ids.cuda()
+
+        # get word embeddings
+        src_emb = self.embs[lang1](Variable(src_ids, volatile=True))
+        tgt_emb = self.embs[lang2](Variable(tgt_ids, volatile=True))
+        tgt_emb = Variable(tgt_emb.data, volatile=volatile)
+        # map
+        src_emb = self.mappings[lang1](Variable(src_emb.data, volatile=volatile))
+        # decode
+        src_emb = F.linear(src_emb, self.mappings[lang2].weight.t())
+
+        return src_emb, tgt_emb
+
     def dis_step(self, stats):
         """
         Train the discriminator.
         """
-        self.discriminator.train()
+        for disc in self.discriminators.values():
+            disc.train()
 
         # loss
-        x, y = self.get_dis_xy(volatile=True)
-        preds = self.discriminator(Variable(x.data))
-        loss = F.binary_cross_entropy(preds, y)
-        stats['DIS_COSTS'].append(loss.data[0])
+        loss = 0
+        # for each target language
+        for lang2 in self.params.all_langs:
+            # random select a source language
+            lang1 = random.choice(self.params.all_langs)
+
+            x, y = self.get_dis_xy(lang1, lang2, volatile=True)
+            preds = self.discriminators[lang2](Variable(x.data))
+            loss += F.binary_cross_entropy(preds, y)
 
         # check NaN
         if (loss != loss).data.any():
             logger.error("NaN detected (discriminator)")
             exit()
+        stats['DIS_COSTS'].append(loss.data[0])
 
         # optim
         self.dis_optimizer.zero_grad()
         loss.backward()
         self.dis_optimizer.step()
-        clip_parameters(self.discriminator, self.params.dis_clip_weights)
+        for d in self.discriminators:
+            clip_parameters(d, self.params.dis_clip_weights)
 
     def mapping_step(self, stats):
         """
@@ -110,12 +162,17 @@ class Trainer(object):
         if self.params.dis_lambda == 0:
             return 0
 
-        self.discriminator.eval()
+        for disc in self.discriminators.values():
+            disc.eval()
 
         # loss
-        x, y = self.get_dis_xy(volatile=False)
-        preds = self.discriminator(x)
-        loss = F.binary_cross_entropy(preds, 1 - y)
+        loss = 0
+        for lang1 in self.params.all_langs:
+            lang2 = random.choice(self.params.all_langs)
+
+            x, y = self.get_dis_xy(lang1, lang2, volatile=False)
+            preds = self.discriminators[lang2](x)
+            loss += F.binary_cross_entropy(preds, 1 - y)
         loss = self.params.dis_lambda * loss
 
         # check NaN
@@ -129,63 +186,94 @@ class Trainer(object):
         self.map_optimizer.step()
         self.orthogonalize()
 
-        return 2 * self.params.batch_size
+        return len(self.params.all_langs) * self.params.batch_size
 
     def load_training_dico(self, dico_train):
         """
         Load training dictionary.
         """
-        word2id1 = self.src_dico.word2id
-        word2id2 = self.tgt_dico.word2id
+        # load dicos for all lang pairs
+        for i, lang1 in enumerate(self.params.all_langs):
+            for j, lang2 in enumerate(self.params.all_langs):
+                word2id1 = self.vocabs[lang1].word2id
+                word2id2 = self.vocabs[lang2].word2id
 
-        # identical character strings
-        if dico_train == "identical_char":
-            self.dico = load_identical_char_dico(word2id1, word2id2)
-        # use one of the provided dictionary
-        elif dico_train == "default":
-            filename = '%s-%s.0-5000.txt' % (self.params.src_lang, self.params.tgt_lang)
-            self.dico = load_dictionary(
-                os.path.join(DIC_EVAL_PATH, filename),
-                word2id1, word2id2
-            )
-        # dictionary provided by the user
-        else:
-            self.dico = load_dictionary(dico_train, word2id1, word2id2)
-
-        # cuda
-        if self.params.cuda:
-            self.dico = self.dico.cuda()
+                # identical character strings
+                if dico_train == "identical_char":
+                    self.dicos[(lang1, lang2)] = load_identical_char_dico(word2id1, word2id2)
+                # use one of the provided dictionary
+                elif dico_train == "default":
+                    filename = '%s-%s.0-5000.txt' % (lang1, lang2)
+                    self.dicos[(lang1, lang2)] = load_dictionary(
+                        os.path.join(DIC_EVAL_PATH, filename),
+                        word2id1, word2id2
+                    )
+                # TODO dictionary provided by the user
+                else:
+                    # self.dicos[(lang1, lang2)] = load_dictionary(dico_train, word2id1, word2id2)
+                    raise NotImplemented(dico_train)
+                # cuda
+                if self.params.cuda:
+                    self.dicos[(lang1, lang2)] = self.dicos[(lang1, lang2)].cuda()
 
     def build_dictionary(self):
         """
-        Build a dictionary from aligned embeddings.
+        Build dictionaries from aligned embeddings.
         """
-        src_emb = self.mapping(self.src_emb.weight).data
-        tgt_emb = self.tgt_emb.weight.data
-        src_emb = src_emb / src_emb.norm(2, 1, keepdim=True).expand_as(src_emb)
-        tgt_emb = tgt_emb / tgt_emb.norm(2, 1, keepdim=True).expand_as(tgt_emb)
-        self.dico = build_dictionary(src_emb, tgt_emb, self.params)
+        # build dicos for all lang pairs
+        for i, lang1 in enumerate(self.params.all_langs):
+            for j, lang2 in enumerate(self.params.all_langs):
+                if i < j:
+                    src_emb = self.embs[lang1].weight
+                    # src_emb = self.mappings[lang1](src_emb).data
+                    src_emb = apply_mapping(self.mappings[lang1], src_emb).detach()
+                    tgt_emb = self.embs[lang2].weight
+                    # tgt_emb = self.mappings[lang2](tgt_emb).data
+                    tgt_emb = apply_mapping(self.mappings[lang2], tgt_emb).detach()
+                    src_emb = src_emb / src_emb.norm(2, 1, keepdim=True).expand_as(src_emb)
+                    tgt_emb = tgt_emb / tgt_emb.norm(2, 1, keepdim=True).expand_as(tgt_emb)
+                    self.dicos[(lang1, lang2)] = build_dictionary(src_emb, tgt_emb, self.params)
+                elif i > j:
+                    self.dicos[(lang1, lang2)] = self.dicos[(lang2, lang1)][:, [1,0]]
+                else:
+                    idx = torch.arange(self.params.dico_max_rank).long().view(self.params.dico_max_rank, 1)
+                    self.dicos[(lang1, lang2)] = torch.cat([idx, idx], dim=1)
+                    if self.params.cuda:
+                        self.dicos[(lang1, lang2)] = self.dicos[(lang1, lang2)].cuda()
 
-    def procrustes(self):
-        """
-        Find the best orthogonal matrix mapping using the Orthogonal Procrustes problem
-        https://en.wikipedia.org/wiki/Orthogonal_Procrustes_problem
-        """
-        A = self.src_emb.weight.data[self.dico[:, 0]]
-        B = self.tgt_emb.weight.data[self.dico[:, 1]]
-        W = self.mapping.weight.data
-        M = B.transpose(0, 1).mm(A).cpu().numpy()
-        U, S, V_t = scipy.linalg.svd(M, full_matrices=True)
-        W.copy_(torch.from_numpy(U.dot(V_t)).type_as(W))
+    def mpsr_step(self, stats):
+        # loss
+        loss = 0
+        for lang1 in self.params.all_langs:
+            lang2 = random.choice(self.params.all_langs)
+
+            x, y = self.get_mpsr_xy(lang1, lang2, volatile=False)
+            loss += F.mse_loss(x, y)
+        # check NaN
+        if (loss != loss).data.any():
+            logger.error("NaN detected (fool discriminator)")
+            exit()
+
+        stats['MPSR_COSTS'].append(loss.data[0])
+        # optim
+        self.mpsr_optimizer.zero_grad()
+        loss.backward()
+        self.mpsr_optimizer.step()
+
+        if self.params.mpsr_orthogonalize:
+            self.orthogonalize()
+
+        return len(self.params.all_langs) * self.params.batch_size
 
     def orthogonalize(self):
         """
         Orthogonalize the mapping.
         """
         if self.params.map_beta > 0:
-            W = self.mapping.weight.data
-            beta = self.params.map_beta
-            W.copy_((1 + beta) * W - beta * W.mm(W.transpose(0, 1).mm(W)))
+            for mapping in self.mappings.values():
+                W = mapping.weight.data
+                beta = self.params.map_beta
+                W.copy_((1 + beta) * W - beta * W.mm(W.transpose(0, 1).mm(W)))
 
     def update_lr(self, to_log, metric):
         """
@@ -212,6 +300,31 @@ class Trainer(object):
                                 % (old_lr, self.map_optimizer.param_groups[0]['lr']))
                 self.decrease_lr = True
 
+    def update_mpsr_lr(self, to_log, metric):
+        """
+        Update learning rate when using SGD.
+        """
+        if 'sgd' not in self.params.mpsr_optimizer:
+            return
+        old_lr = self.mpsr_optimizer.param_groups[0]['lr']
+        new_lr = max(self.params.min_lr, old_lr * self.params.lr_decay)
+        if new_lr < old_lr:
+            logger.info("Decreasing learning rate: %.8f -> %.8f" % (old_lr, new_lr))
+            self.mpsr_optimizer.param_groups[0]['lr'] = new_lr
+
+        if self.params.lr_shrink < 1 and to_log[metric] >= -1e7:
+            if to_log[metric] < self.best_valid_metric:
+                logger.info("Validation metric is smaller than the best: %.5f vs %.5f"
+                            % (to_log[metric], self.best_valid_metric))
+                # decrease the learning rate, only if this is the
+                # second time the validation metric decreases
+                if self.decrease_lr:
+                    old_lr = self.mpsr_optimizer.param_groups[0]['lr']
+                    self.mpsr_optimizer.param_groups[0]['lr'] *= self.params.lr_shrink
+                    logger.info("Shrinking the learning rate: %.5f -> %.5f"
+                                % (old_lr, self.mpsr_optimizer.param_groups[0]['lr']))
+                self.decrease_lr = True
+
     def save_best(self, to_log, metric):
         """
         Save the best model for the given validation metric.
@@ -222,45 +335,41 @@ class Trainer(object):
             self.best_valid_metric = to_log[metric]
             logger.info('* Best value for "%s": %.5f' % (metric, to_log[metric]))
             # save the mapping
-            W = self.mapping.weight.data.cpu().numpy()
-            path = os.path.join(self.params.exp_path, 'best_mapping.pth')
-            logger.info('* Saving the mapping to %s ...' % path)
-            torch.save(W, path)
+            tgt_lang = self.params.tgt_lang
+            for src_lang in self.params.src_langs:
+                W = self.mappings[src_lang].weight.data.cpu().numpy()
+                path = os.path.join(self.params.exp_path,
+                                    f'best_mapping_{src_lang}2{tgt_lang}.t7')
+                logger.info(f'* Saving the {src_lang} to {tgt_lang} mapping to %s ...' % path)
+                torch.save(W, path)
 
     def reload_best(self):
         """
         Reload the best mapping.
         """
-        path = os.path.join(self.params.exp_path, 'best_mapping.pth')
-        logger.info('* Reloading the best model from %s ...' % path)
-        # reload the model
-        assert os.path.isfile(path)
-        to_reload = torch.from_numpy(torch.load(path))
-        W = self.mapping.weight.data
-        assert to_reload.size() == W.size()
-        W.copy_(to_reload.type_as(W))
+        tgt_lang = self.params.tgt_lang
+        for src_lang in self.params.src_langs:
+            path = os.path.join(self.params.exp_path,
+                                f'best_mapping_{src_lang}2{tgt_lang}.t7')
+            logger.info(f'* Reloading the best {src_lang} to {tgt_lang} model from {path} ...')
+            # reload the model
+            assert os.path.isfile(path)
+            to_reload = torch.from_numpy(torch.load(path))
+            W = self.mappings[src_lang].weight.data
+            assert to_reload.size() == W.size()
+            W.copy_(to_reload.type_as(W))
 
     def export(self):
         """
         Export embeddings.
         """
-        params = self.params
-
-        # load all embeddings
-        logger.info("Reloading all embeddings for mapping ...")
-        params.src_dico, src_emb = load_embeddings(params, source=True, full_vocab=True)
-        params.tgt_dico, tgt_emb = load_embeddings(params, source=False, full_vocab=True)
-
-        # apply same normalization as during training
-        normalize_embeddings(src_emb, params.normalize_embeddings, mean=params.src_mean)
-        normalize_embeddings(tgt_emb, params.normalize_embeddings, mean=params.tgt_mean)
-
-        # map source embeddings to the target space
-        bs = 4096
-        logger.info("Map source embeddings to the target space ...")
-        for i, k in enumerate(range(0, len(src_emb), bs)):
-            x = Variable(src_emb[k:k + bs], volatile=True)
-            src_emb[k:k + bs] = self.mapping(x.cuda() if params.cuda else x).data.cpu()
-
-        # write embeddings to the disk
-        export_embeddings(src_emb, tgt_emb, params)
+        # export target embeddings
+        tgt_emb = self.embs[self.params.tgt_lang].weight.data
+        tgt_emb = tgt_emb / tgt_emb.norm(2, 1, keepdim=True).expand_as(tgt_emb)
+        export_embeddings(tgt_emb, self.params.tgt_lang, self.params)
+        # export all source embeddings
+        for src_lang in self.params.src_langs:
+            logger.info(f"Map {src_lang} embeddings to the target space ...")
+            src_emb = apply_mapping(self.mappings[src_lang], self.embs[src_lang].weight.data)
+            # src_emb = src_emb / src_emb.norm(2, 1, keepdim=True).expand_as(src_emb)
+            export_embeddings(src_emb.cpu().numpy(), src_lang, self.params)

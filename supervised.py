@@ -1,4 +1,5 @@
-# Copyright (c) 2017-present, Facebook, Inc.
+# Original work Copyright (c) 2017-present, Facebook, Inc.
+# Modified work Copyright (c) 2018, Xilun Chen
 # All rights reserved.
 #
 # This source code is licensed under the license found in the
@@ -9,6 +10,8 @@ import os
 import json
 import argparse
 from collections import OrderedDict
+import numpy as np
+import time
 import torch
 
 from src.utils import bool_flag, initialize_exp
@@ -19,7 +22,8 @@ from src.evaluation import Evaluator
 
 VALIDATION_METRIC_SUP = 'precision_at_1-csls_knn_10'
 VALIDATION_METRIC_UNSUP = 'mean_cosine-csls_knn_10-S2T-10000'
-
+# default path to embeddings embeddings if not otherwise specified
+EMB_DIR = 'data/fasttext-vectors/'
 
 # main
 parser = argparse.ArgumentParser(description='Supervised training')
@@ -32,12 +36,18 @@ parser.add_argument("--cuda", type=bool_flag, default=True, help="Run on GPU")
 parser.add_argument("--export", type=str, default="txt", help="Export embeddings after training (txt / pth)")
 
 # data
-parser.add_argument("--src_lang", type=str, default='en', help="Source language")
+parser.add_argument("--src_langs", type=str, nargs='+', default=['de', 'es', 'fr', 'it', 'pt'], help="Source languages")
 parser.add_argument("--tgt_lang", type=str, default='es', help="Target language")
 parser.add_argument("--emb_dim", type=int, default=300, help="Embedding dimension")
 parser.add_argument("--max_vocab", type=int, default=200000, help="Maximum vocabulary size (-1 to disable)")
 # training refinement
 parser.add_argument("--n_refinement", type=int, default=5, help="Number of refinement iterations (0 to disable the refinement procedure)")
+parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
+parser.add_argument("--map_beta", type=float, default=0.001, help="Beta for orthogonalization")
+# MPSR parameters
+parser.add_argument("--mpsr_optimizer", type=str, default="adam", help="Multilingual Pseudo-Supervised Refinement optimizer")
+parser.add_argument("--mpsr_orthogonalize", type=bool_flag, default=True, help="During MPSR, whether to perform orthogonalization")
+parser.add_argument("--mpsr_n_steps", type=int, default=30000, help="Number of optimization steps for MPSR")
 # dictionary creation parameters (for refinement)
 parser.add_argument("--dico_train", type=str, default="default", help="Path to training dictionary (default: use identical character strings)")
 parser.add_argument("--dico_eval", type=str, default="default", help="Path to evaluation dictionary")
@@ -47,8 +57,9 @@ parser.add_argument("--dico_threshold", type=float, default=0, help="Threshold c
 parser.add_argument("--dico_max_rank", type=int, default=10000, help="Maximum dictionary words rank (0 to disable)")
 parser.add_argument("--dico_min_size", type=int, default=0, help="Minimum generated dictionary size (0 to disable)")
 parser.add_argument("--dico_max_size", type=int, default=0, help="Maximum generated dictionary size (0 to disable)")
+parser.add_argument("--semeval_ignore_oov", type=bool_flag, default=True, help="Whether to ignore OOV in SEMEVAL evaluation (the original authors used True)")
 # reload pre-trained embeddings
-parser.add_argument("--src_emb", type=str, default='', help="Reload source embeddings")
+parser.add_argument("--src_embs", type=str, nargs='+', default=[], help="Reload source embeddings (should be in the same order as in src_langs)")
 parser.add_argument("--tgt_emb", type=str, default='', help="Reload target embeddings")
 parser.add_argument("--normalize_embeddings", type=str, default="", help="Normalize embeddings before training")
 
@@ -56,21 +67,33 @@ parser.add_argument("--normalize_embeddings", type=str, default="", help="Normal
 # parse parameters
 params = parser.parse_args()
 
+# post-processing options
+params.src_N = len(params.src_langs)
+params.all_langs = params.src_langs + [params.tgt_lang]
+# load default embeddings if no embeddings specified
+if len(params.src_embs) == 0:
+    params.src_embs = []
+    for lang in params.src_langs:
+        params.src_embs.append(os.path.join(EMB_DIR, f'wiki.{lang}.vec'))
+if len(params.tgt_emb) == 0:
+    params.tgt_emb = os.path.join(EMB_DIR, f'wiki.{params.tgt_lang}.vec')
+
 # check parameters
 assert not params.cuda or torch.cuda.is_available()
 assert params.dico_train in ["identical_char", "default"] or os.path.isfile(params.dico_train)
 assert params.dico_build in ["S2T", "T2S", "S2T|T2S", "S2T&T2S"]
 assert params.dico_max_size == 0 or params.dico_max_size < params.dico_max_rank
 assert params.dico_max_size == 0 or params.dico_max_size > params.dico_min_size
-assert os.path.isfile(params.src_emb)
+assert all([os.path.isfile(emb) for emb in params.src_embs])
 assert os.path.isfile(params.tgt_emb)
 assert params.dico_eval == 'default' or os.path.isfile(params.dico_eval)
 assert params.export in ["", "txt", "pth"]
 
 # build logger / model / trainer / evaluator
 logger = initialize_exp(params)
-src_emb, tgt_emb, mapping, _ = build_model(params, False)
-trainer = Trainer(src_emb, tgt_emb, mapping, None, params)
+# N+1 embeddings, N mappings , N+1 discriminators
+embs, mappings, discriminators = build_model(params, False)
+trainer = Trainer(embs, mappings, discriminators, params)
 evaluator = Evaluator(trainer)
 
 # load a training dictionary. if a dictionary path is not provided, use a default
@@ -84,27 +107,46 @@ logger.info("Validation metric: %s" % VALIDATION_METRIC)
 """
 Learning loop for Procrustes Iterative Learning
 """
-for n_iter in range(params.n_refinement + 1):
+for n_epoch in range(params.n_refinement + 1):
 
-    logger.info('Starting iteration %i...' % n_iter)
+    logger.info('Starting iteration %i...' % n_epoch)
 
     # build a dictionary from aligned embeddings (unless
     # it is the first iteration and we use the init one)
-    if n_iter > 0 or not hasattr(trainer, 'dico'):
+    if n_epoch > 0 or not hasattr(trainer, 'dicos'):
         trainer.build_dictionary()
 
-    # apply the Procrustes solution
-    trainer.procrustes()
+    # optimize MPSR
+    tic = time.time()
+    n_words_mpsr = 0
+    stats = {'MPSR_COSTS': []}
+    for n_iter in range(params.mpsr_n_steps):
+        # mpsr training step
+        n_words_mpsr += trainer.mpsr_step(stats)
+        # log stats
+        if n_iter % 500 == 0:
+            stats_str = [('MPSR_COSTS', 'MPSR loss')]
+            stats_log = ['%s: %.4f' % (v, np.mean(stats[k]))
+                         for k, v in stats_str if len(stats[k]) > 0]
+            stats_log.append('%i samples/s' % int(n_words_mpsr / (time.time() - tic)))
+            logger.info(('%06i - ' % n_iter) + ' - '.join(stats_log))
+            # reset
+            tic = time.time()
+            n_words_mpsr = 0
+            for k, _ in stats_str:
+                del stats[k][:]
 
     # embeddings evaluation
-    to_log = OrderedDict({'n_iter': n_iter})
+    to_log = OrderedDict({'n_epoch': n_epoch})
     evaluator.all_eval(to_log)
 
     # JSON log / save best model / end of epoch
     logger.info("__log__:%s" % json.dumps(to_log))
     trainer.save_best(to_log, VALIDATION_METRIC)
-    logger.info('End of iteration %i.\n\n' % n_iter)
+    logger.info('End of iteration %i.\n\n' % n_epoch)
 
+    # update the learning rate (effective only if using SGD for MPSR)
+    trainer.update_mpsr_lr(to_log, VALIDATION_METRIC)
 
 # export embeddings
 if params.export:

@@ -1,4 +1,5 @@
-# Copyright (c) 2017-present, Facebook, Inc.
+# Original work Copyright (c) 2017-present, Facebook, Inc.
+# Modified work Copyright (c) 2018, Xilun Chen
 # All rights reserved.
 #
 # This source code is licensed under the license found in the
@@ -119,6 +120,8 @@ def get_candidates(emb1, emb2, params):
         mask = selected.unsqueeze(1).expand_as(all_scores).clone()
         all_scores = all_scores.masked_select(mask).view(-1, 2)
         all_pairs = all_pairs.masked_select(mask).view(-1, 2)
+        if len(all_pairs) == 0:
+            return []
 
     # max dico size
     if params.dico_max_size > 0:
@@ -174,5 +177,7 @@ def build_dictionary(src_emb, tgt_emb, params, s2t_candidates=None, t2s_candidat
                 return None
         dico = torch.LongTensor(list([[int(a), int(b)] for (a, b) in final_pairs]))
 
+    if len(dico) == 0:
+        return None
     logger.info('New train dictionary of %i pairs.' % dico.size(0))
     return dico.cuda() if params.cuda else dico
