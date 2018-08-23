@@ -1,4 +1,5 @@
-# Copyright (c) 2017-present, Facebook, Inc.
+# Original work Copyright (c) 2017-present, Facebook, Inc.
+# Modified work Copyright (c) 2018, Xilun Chen
 # All rights reserved.
 #
 # This source code is licensed under the license found in the
@@ -56,7 +57,7 @@ def get_word_id(word, word2id, lower):
 
 
 def get_spearman_rho(word2id1, embeddings1, path, lower,
-                     word2id2=None, embeddings2=None):
+                     word2id2=None, embeddings2=None, ignore_oov=True):
     """
     Compute monolingual or cross-lingual word similarity score.
     """
@@ -75,6 +76,9 @@ def get_spearman_rho(word2id1, embeddings1, path, lower,
         id2 = get_word_id(word2, word2id2, lower)
         if id1 is None or id2 is None:
             not_found += 1
+            if not ignore_oov:
+                gold.append(similarity)
+                pred.append(0.5)
             continue
         u = embeddings1[id1]
         v = embeddings2[id2]
@@ -196,7 +200,8 @@ def get_wordanalogy_scores(language, word2id, embeddings, lower=True):
 
 
 def get_crosslingual_wordsim_scores(lang1, word2id1, embeddings1,
-                                    lang2, word2id2, embeddings2, lower=True):
+                                    lang2, word2id2, embeddings2,
+                                    lower=True, ignore_oov=True):
     """
     Return cross-lingual word similarity scores.
     """
@@ -208,12 +213,12 @@ def get_crosslingual_wordsim_scores(lang1, word2id1, embeddings1,
     if os.path.exists(f1):
         coeff, found, not_found = get_spearman_rho(
             word2id1, embeddings1, f1,
-            lower, word2id2, embeddings2
+            lower, word2id2, embeddings2, ignore_oov
         )
     elif os.path.exists(f2):
         coeff, found, not_found = get_spearman_rho(
             word2id2, embeddings2, f2,
-            lower, word2id1, embeddings1
+            lower, word2id1, embeddings1, ignore_oov
         )
 
     scores = {}

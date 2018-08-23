@@ -1,4 +1,5 @@
-# Copyright (c) 2017-present, Facebook, Inc.
+# Original work Copyright (c) 2017-present, Facebook, Inc.
+# Modified work Copyright (c) 2018, Xilun Chen
 # All rights reserved.
 #
 # This source code is licensed under the license found in the
@@ -13,9 +14,10 @@ from .utils import load_embeddings, normalize_embeddings
 
 class Discriminator(nn.Module):
 
-    def __init__(self, params):
+    def __init__(self, params, lang):
         super(Discriminator, self).__init__()
 
+        self.lang = lang
         self.emb_dim = params.emb_dim
         self.dis_layers = params.dis_layers
         self.dis_hid_dim = params.dis_hid_dim
@@ -43,40 +45,55 @@ def build_model(params, with_dis):
     Build all components of the model.
     """
     # source embeddings
-    src_dico, _src_emb = load_embeddings(params, source=True)
-    params.src_dico = src_dico
-    src_emb = nn.Embedding(len(src_dico), params.emb_dim, sparse=True)
-    src_emb.weight.data.copy_(_src_emb)
+    params.vocabs, _src_embs, embs = {}, {}, {}
+    for i, lang in enumerate(params.src_langs):
+        dico, emb = load_embeddings(params, lang, params.src_embs[i])
+        params.vocabs[lang] = dico
+        _src_embs[lang] = emb
+    for i, lang in enumerate(params.src_langs):
+        src_emb = nn.Embedding(len(params.vocabs[lang]), params.emb_dim, sparse=True)
+        src_emb.weight.data.copy_(_src_embs[lang])
+        embs[lang] = (src_emb)
 
     # target embeddings
     if params.tgt_lang:
-        tgt_dico, _tgt_emb = load_embeddings(params, source=False)
-        params.tgt_dico = tgt_dico
+        tgt_dico, _tgt_emb = load_embeddings(params, params.tgt_lang, params.tgt_emb)
+        params.vocabs[params.tgt_lang] = tgt_dico
         tgt_emb = nn.Embedding(len(tgt_dico), params.emb_dim, sparse=True)
         tgt_emb.weight.data.copy_(_tgt_emb)
+        embs[params.tgt_lang] = tgt_emb
     else:
         tgt_emb = None
 
-    # mapping
-    mapping = nn.Linear(params.emb_dim, params.emb_dim, bias=False)
+    # mappings
+    mappings = {lang: nn.Linear(params.emb_dim, params.emb_dim,
+                          bias=False) for lang in params.src_langs}
+    # set tgt mapping to fixed identity matrix
+    tgt_map = nn.Linear(params.emb_dim, params.emb_dim, bias=False)
+    tgt_map.weight.data.copy_(torch.diag(torch.ones(params.emb_dim)))
+    for p in tgt_map.parameters():
+        p.requires_grad = False
+    mappings[params.tgt_lang] = tgt_map
     if getattr(params, 'map_id_init', True):
-        mapping.weight.data.copy_(torch.diag(torch.ones(params.emb_dim)))
+        for mapping in mappings.values():
+            mapping.weight.data.copy_(torch.diag(torch.ones(params.emb_dim)))
 
-    # discriminator
-    discriminator = Discriminator(params) if with_dis else None
+    # discriminators
+    discriminators = {lang: Discriminator(params, lang)
+            for lang in params.all_langs} if with_dis else None
 
     # cuda
     if params.cuda:
-        src_emb.cuda()
-        if params.tgt_lang:
-            tgt_emb.cuda()
-        mapping.cuda()
+        for emb in embs.values():
+            emb.cuda()
+        for mapping in mappings.values():
+            mapping.cuda()
         if with_dis:
-            discriminator.cuda()
+            for disc in discriminators.values():
+                disc.cuda()
 
     # normalize embeddings
-    params.src_mean = normalize_embeddings(src_emb.weight.data, params.normalize_embeddings)
-    if params.tgt_lang:
-        params.tgt_mean = normalize_embeddings(tgt_emb.weight.data, params.normalize_embeddings)
+    for lang, emb in embs.items():
+        normalize_embeddings(emb.weight.data, params.normalize_embeddings)
 
-    return src_emb, tgt_emb, mapping, discriminator
+    return embs, mappings, discriminators

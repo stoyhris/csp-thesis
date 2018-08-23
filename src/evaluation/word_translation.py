@@ -1,4 +1,5 @@
-# Copyright (c) 2017-present, Facebook, Inc.
+# Original work Copyright (c) 2017-present, Facebook, Inc.
+# Modified work Copyright (c) 2018, Xilun Chen
 # All rights reserved.
 #
 # This source code is licensed under the license found in the
@@ -64,10 +65,10 @@ def load_dictionary(path, word2id1, word2id2):
                 not_found1 += int(word1 not in word2id1)
                 not_found2 += int(word2 not in word2id2)
 
-    logger.info("Found %i pairs of words in the dictionary (%i unique). "
+    logger.info("Found %i pairs of words in %s (%i unique). "
                 "%i other pairs contained at least one unknown word "
                 "(%i in lang1, %i in lang2)"
-                % (len(pairs), len(set([x for x, _ in pairs])),
+                % (len(pairs), path, len(set([x for x, _ in pairs])),
                    not_found, not_found1, not_found2))
 
     # sort the dictionary by source word frequencies
@@ -87,8 +88,12 @@ def get_word_translation_accuracy(lang1, word2id1, emb1, lang2, word2id2, emb2, 
     """
     if dico_eval == 'default':
         path = os.path.join(DIC_EVAL_PATH, '%s-%s.5000-6500.txt' % (lang1, lang2))
+    elif dico_eval == 'train':
+        path = os.path.join(DIC_EVAL_PATH, '%s-%s.0-5000.txt' % (lang1, lang2))
+    elif dico_eval == 'all':
+        path = os.path.join(DIC_EVAL_PATH, '%s-%s.txt' % (lang1, lang2))
     else:
-        path = dico_eval
+        raise NotImplemented(dico_eval)
     dico = load_dictionary(path, word2id1, word2id2)
     dico = dico.cuda() if emb1.is_cuda else dico
 
