@@ -9,7 +9,7 @@
 from logging import getLogger
 from copy import deepcopy
 import numpy as np
-from torch.autograd import Variable
+import torch
 from torch import Tensor as torch_tensor
 from torch.nn import functional as F
 
@@ -361,13 +361,15 @@ class Evaluator(object):
             real_preds = []
             fake_preds = []
             for i in range(0, self.embs[src_lang].num_embeddings, bs):
-                emb = Variable(self.embs[src_lang].weight[i:i + bs].data, volatile=True)
-                preds = self.discriminators[src_lang](emb)
+                with torch.no_grad():
+                    emb = self.embs[src_lang].weight[i:i + bs].detach()
+                    preds = self.discriminators[src_lang](emb)
                 real_preds.extend(preds.data.cpu().tolist())
             for i in range(0, self.embs[tgt_lang].num_embeddings, bs):
-                emb = Variable(self.embs[tgt_lang].weight[i:i + bs].data, volatile=True)
-                emb = F.linear(emb, self.mappings[src_lang].weight.t())
-                preds = self.discriminators[src_lang](emb)
+                with torch.no_grad():
+                    emb = self.embs[tgt_lang].weight[i:i + bs].detach()
+                    emb = F.linear(emb, self.mappings[src_lang].weight.t())
+                    preds = self.discriminators[src_lang](emb)
                 fake_preds.extend(preds.data.cpu().tolist())
             dis_accus[src_lang] = self.eval_discriminator(to_log, src_lang, real_preds, fake_preds)
 
@@ -375,14 +377,16 @@ class Evaluator(object):
         real_preds = []
         fake_preds = []
         for i in range(0, self.embs[tgt_lang].num_embeddings, bs):
-            emb = Variable(self.embs[tgt_lang].weight[i:i + bs].data, volatile=True)
-            preds = self.discriminators[src_lang](emb)
+            with torch.no_grad():
+                emb = self.embs[tgt_lang].weight[i:i + bs].detach()
+                preds = self.discriminators[src_lang](emb)
             real_preds.extend(preds.data.cpu().tolist())
         for src_lang in self.params.src_langs:
             # sub-sample
             for i in range(0, self.embs[src_lang].num_embeddings // self.params.src_N, bs):
-                emb = Variable(self.embs[src_lang].weight[i:i + bs].data, volatile=True)
-                preds = self.discriminators[src_lang](self.mappings[src_lang](emb))
+                with torch.no_grad():
+                    emb = self.embs[src_lang].weight[i:i + bs].detach()
+                    preds = self.discriminators[src_lang](self.mappings[src_lang](emb))
                 fake_preds.extend(preds.data.cpu().tolist())
         dis_accus[tgt_lang] = self.eval_discriminator(to_log, tgt_lang, real_preds, fake_preds)
 

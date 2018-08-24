@@ -32,7 +32,8 @@ parser.add_argument("--verbose", type=int, default=2, help="Verbose level (2:deb
 parser.add_argument("--exp_path", type=str, default="", help="Where to store experiment logs and models")
 parser.add_argument("--exp_name", type=str, default="debug", help="Experiment name")
 parser.add_argument("--exp_id", type=str, default="", help="Experiment ID")
-parser.add_argument("--cuda", type=bool_flag, default=True, help="Run on GPU")
+# parser.add_argument("--cuda", type=bool_flag, default=True, help="Run on GPU")
+parser.add_argument("--device", type=str, default="cuda", help="Run on GPU or CPU")
 parser.add_argument("--export", type=str, default="txt", help="Export embeddings after training (txt / pth)")
 # data
 parser.add_argument("--src_langs", type=str, nargs='+', default=['de', 'es', 'fr', 'it', 'pt'], help="Source languages")
@@ -99,7 +100,7 @@ if len(params.tgt_emb) == 0:
     params.tgt_emb = os.path.join(EMB_DIR, f'wiki.{params.tgt_lang}.vec')
 
 # check parameters
-assert not params.cuda or torch.cuda.is_available()
+assert not params.device.lower().startswith('cuda') or torch.cuda.is_available()
 assert 0 <= params.dis_dropout < 1
 assert 0 <= params.dis_input_dropout < 1
 assert 0 <= params.dis_smooth < 0.5

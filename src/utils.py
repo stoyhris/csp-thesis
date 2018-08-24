@@ -53,7 +53,7 @@ def initialize_exp(params, dump_params=True, log_name='train.log'):
     if getattr(params, 'seed', -1) >= 0:
         np.random.seed(params.seed)
         torch.manual_seed(params.seed)
-        if params.cuda:
+        if params.device.lower().startswith('cuda'):
             torch.cuda.manual_seed(params.seed)
 
     # dump parameters
@@ -308,7 +308,8 @@ def read_txt_embeddings(params, lang, emb_path, full_vocab):
     dico = Dictionary(id2word, word2id, lang)
     embeddings = np.concatenate(vectors, 0)
     embeddings = torch.from_numpy(embeddings).float()
-    embeddings = embeddings.cuda() if (params.cuda and not full_vocab) else embeddings
+    if not full_vocab:
+        embeddings = embeddings.to(params.device)
 
     assert embeddings.size() == (len(dico), params.emb_dim)
     return dico, embeddings

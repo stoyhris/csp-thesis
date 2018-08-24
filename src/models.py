@@ -53,7 +53,7 @@ def build_model(params, with_dis):
     for i, lang in enumerate(params.src_langs):
         src_emb = nn.Embedding(len(params.vocabs[lang]), params.emb_dim, sparse=True)
         src_emb.weight.data.copy_(_src_embs[lang])
-        embs[lang] = (src_emb)
+        embs[lang] = src_emb
 
     # target embeddings
     if params.tgt_lang:
@@ -82,15 +82,11 @@ def build_model(params, with_dis):
     discriminators = {lang: Discriminator(params, lang)
             for lang in params.all_langs} if with_dis else None
 
-    # cuda
-    if params.cuda:
-        for emb in embs.values():
-            emb.cuda()
-        for mapping in mappings.values():
-            mapping.cuda()
+    for lang in params.all_langs:
+        embs[lang] = embs[lang].to(params.device)
+        mappings[lang] = mappings[lang].to(params.device)
         if with_dis:
-            for disc in discriminators.values():
-                disc.cuda()
+            discriminators[lang] = discriminators[lang].to(params.device)
 
     # normalize embeddings
     for lang, emb in embs.items():
