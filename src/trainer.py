@@ -15,7 +15,6 @@ import numpy as np
 import scipy
 import scipy.linalg
 import torch
-from torch.autograd import Variable
 from torch.nn import functional as F
 from torch import optim
 
@@ -61,6 +60,7 @@ class Trainer(object):
         self.best_valid_metric = -1e12
 
         self.decrease_lr = False
+        self.decrease_mpsr_lr = False
 
     def get_dis_xy(self, lang1, lang2, volatile):
         """
@@ -73,18 +73,17 @@ class Trainer(object):
         assert mf <= min(map(len, self.vocabs.values()))
         src_ids = torch.LongTensor(bs).random_(len(self.vocabs[lang1]) if mf == 0 else mf)
         tgt_ids = torch.LongTensor(bs).random_(len(self.vocabs[lang2]) if mf == 0 else mf)
-        if self.params.cuda:
-            src_ids = src_ids.cuda()
-            tgt_ids = tgt_ids.cuda()
+        src_ids = src_ids.to(self.params.device)
+        tgt_ids = tgt_ids.to(self.params.device)
 
-        # get word embeddings
-        src_emb = self.embs[lang1](Variable(src_ids, volatile=True))
-        tgt_emb = self.embs[lang2](Variable(tgt_ids, volatile=True))
-        tgt_emb = Variable(tgt_emb.data, volatile=volatile)
-        # map
-        src_emb = self.mappings[lang1](Variable(src_emb.data, volatile=volatile))
-        # decode
-        src_emb = F.linear(src_emb, self.mappings[lang2].weight.t())
+        with torch.set_grad_enabled(not volatile):
+            # get word embeddings
+            src_emb = self.embs[lang1](src_ids).detach()
+            tgt_emb = self.embs[lang2](tgt_ids).detach()
+            # map
+            src_emb = self.mappings[lang1](src_emb)
+            # decode
+            src_emb = F.linear(src_emb, self.mappings[lang2].weight.t())
 
         # input / target
         x = torch.cat([src_emb, tgt_emb], 0)
@@ -92,7 +91,7 @@ class Trainer(object):
         # 0 indicates real (lang2) samples
         y[:bs] = 1 - self.params.dis_smooth
         y[bs:] = self.params.dis_smooth
-        y = Variable(y.cuda() if self.params.cuda else y)
+        y = y.to(self.params.device)
 
         return x, y
 
@@ -103,24 +102,19 @@ class Trainer(object):
         # select random word IDs
         bs = self.params.batch_size
         dico = self.dicos[(lang1, lang2)]
-        indices = torch.from_numpy(np.random.randint(0, len(dico), bs))
-        if self.params.cuda:
-            indices = indices.cuda()
+        indices = torch.from_numpy(np.random.randint(0, len(dico), bs)).to(self.params.device)
         dico = dico.index_select(0, indices)
-        src_ids = dico[:, 0]
-        tgt_ids = dico[:, 1]
-        if self.params.cuda:
-            src_ids = src_ids.cuda()
-            tgt_ids = tgt_ids.cuda()
+        src_ids = dico[:, 0].to(self.params.device)
+        tgt_ids = dico[:, 1].to(self.params.device)
 
-        # get word embeddings
-        src_emb = self.embs[lang1](Variable(src_ids, volatile=True))
-        tgt_emb = self.embs[lang2](Variable(tgt_ids, volatile=True))
-        tgt_emb = Variable(tgt_emb.data, volatile=volatile)
-        # map
-        src_emb = self.mappings[lang1](Variable(src_emb.data, volatile=volatile))
-        # decode
-        src_emb = F.linear(src_emb, self.mappings[lang2].weight.t())
+        with torch.set_grad_enabled(not volatile):
+            # get word embeddings
+            src_emb = self.embs[lang1](src_ids).detach()
+            tgt_emb = self.embs[lang2](tgt_ids).detach()
+            # map
+            src_emb = self.mappings[lang1](src_emb)
+            # decode
+            src_emb = F.linear(src_emb, self.mappings[lang2].weight.t())
 
         return src_emb, tgt_emb
 
@@ -139,14 +133,14 @@ class Trainer(object):
             lang1 = random.choice(self.params.all_langs)
 
             x, y = self.get_dis_xy(lang1, lang2, volatile=True)
-            preds = self.discriminators[lang2](Variable(x.data))
+            preds = self.discriminators[lang2](x.detach())
             loss += F.binary_cross_entropy(preds, y)
 
         # check NaN
-        if (loss != loss).data.any():
+        if (loss != loss).any():
             logger.error("NaN detected (discriminator)")
             exit()
-        stats['DIS_COSTS'].append(loss.data[0])
+        stats['DIS_COSTS'].append(loss.item())
 
         # optim
         self.dis_optimizer.zero_grad()
@@ -176,7 +170,7 @@ class Trainer(object):
         loss = self.params.dis_lambda * loss
 
         # check NaN
-        if (loss != loss).data.any():
+        if (loss != loss).any():
             logger.error("NaN detected (fool discriminator)")
             exit()
 
@@ -195,26 +189,28 @@ class Trainer(object):
         # load dicos for all lang pairs
         for i, lang1 in enumerate(self.params.all_langs):
             for j, lang2 in enumerate(self.params.all_langs):
-                word2id1 = self.vocabs[lang1].word2id
-                word2id2 = self.vocabs[lang2].word2id
-
-                # identical character strings
-                if dico_train == "identical_char":
-                    self.dicos[(lang1, lang2)] = load_identical_char_dico(word2id1, word2id2)
-                # use one of the provided dictionary
-                elif dico_train == "default":
-                    filename = '%s-%s.0-5000.txt' % (lang1, lang2)
-                    self.dicos[(lang1, lang2)] = load_dictionary(
-                        os.path.join(DIC_EVAL_PATH, filename),
-                        word2id1, word2id2
-                    )
-                # TODO dictionary provided by the user
+                if lang1 == lang2:
+                    idx = torch.arange(self.params.dico_max_rank).long().view(self.params.dico_max_rank, 1)
+                    self.dicos[(lang1, lang2)] = torch.cat([idx, idx], dim=1).to(self.params.device)
                 else:
-                    # self.dicos[(lang1, lang2)] = load_dictionary(dico_train, word2id1, word2id2)
-                    raise NotImplemented(dico_train)
-                # cuda
-                if self.params.cuda:
-                    self.dicos[(lang1, lang2)] = self.dicos[(lang1, lang2)].cuda()
+                    word2id1 = self.vocabs[lang1].word2id
+                    word2id2 = self.vocabs[lang2].word2id
+
+                    # identical character strings
+                    if dico_train == "identical_char":
+                        self.dicos[(lang1, lang2)] = load_identical_char_dico(word2id1, word2id2)
+                    # use one of the provided dictionary
+                    elif dico_train == "default":
+                        filename = '%s-%s.0-5000.txt' % (lang1, lang2)
+                        self.dicos[(lang1, lang2)] = load_dictionary(
+                            os.path.join(DIC_EVAL_PATH, filename),
+                            word2id1, word2id2
+                        )
+                    # TODO dictionary provided by the user
+                    else:
+                        # self.dicos[(lang1, lang2)] = load_dictionary(dico_train, word2id1, word2id2)
+                        raise NotImplemented(dico_train)
+                    self.dicos[(lang1, lang2)] = self.dicos[(lang1, lang2)].to(self.params.device)
 
     def build_dictionary(self):
         """
@@ -225,10 +221,8 @@ class Trainer(object):
             for j, lang2 in enumerate(self.params.all_langs):
                 if i < j:
                     src_emb = self.embs[lang1].weight
-                    # src_emb = self.mappings[lang1](src_emb).data
                     src_emb = apply_mapping(self.mappings[lang1], src_emb).detach()
                     tgt_emb = self.embs[lang2].weight
-                    # tgt_emb = self.mappings[lang2](tgt_emb).data
                     tgt_emb = apply_mapping(self.mappings[lang2], tgt_emb).detach()
                     src_emb = src_emb / src_emb.norm(2, 1, keepdim=True).expand_as(src_emb)
                     tgt_emb = tgt_emb / tgt_emb.norm(2, 1, keepdim=True).expand_as(tgt_emb)
@@ -237,9 +231,7 @@ class Trainer(object):
                     self.dicos[(lang1, lang2)] = self.dicos[(lang2, lang1)][:, [1,0]]
                 else:
                     idx = torch.arange(self.params.dico_max_rank).long().view(self.params.dico_max_rank, 1)
-                    self.dicos[(lang1, lang2)] = torch.cat([idx, idx], dim=1)
-                    if self.params.cuda:
-                        self.dicos[(lang1, lang2)] = self.dicos[(lang1, lang2)].cuda()
+                    self.dicos[(lang1, lang2)] = torch.cat([idx, idx], dim=1).to(self.params.device)
 
     def mpsr_step(self, stats):
         # loss
@@ -250,11 +242,11 @@ class Trainer(object):
             x, y = self.get_mpsr_xy(lang1, lang2, volatile=False)
             loss += F.mse_loss(x, y)
         # check NaN
-        if (loss != loss).data.any():
+        if (loss != loss).any():
             logger.error("NaN detected (fool discriminator)")
             exit()
 
-        stats['MPSR_COSTS'].append(loss.data[0])
+        stats['MPSR_COSTS'].append(loss.item())
         # optim
         self.mpsr_optimizer.zero_grad()
         loss.backward()
@@ -271,7 +263,7 @@ class Trainer(object):
         """
         if self.params.map_beta > 0:
             for mapping in self.mappings.values():
-                W = mapping.weight.data
+                W = mapping.weight.detach()
                 beta = self.params.map_beta
                 W.copy_((1 + beta) * W - beta * W.mm(W.transpose(0, 1).mm(W)))
 
@@ -318,12 +310,12 @@ class Trainer(object):
                             % (to_log[metric], self.best_valid_metric))
                 # decrease the learning rate, only if this is the
                 # second time the validation metric decreases
-                if self.decrease_lr:
+                if self.decrease_mpsr_lr:
                     old_lr = self.mpsr_optimizer.param_groups[0]['lr']
                     self.mpsr_optimizer.param_groups[0]['lr'] *= self.params.lr_shrink
                     logger.info("Shrinking the learning rate: %.5f -> %.5f"
                                 % (old_lr, self.mpsr_optimizer.param_groups[0]['lr']))
-                self.decrease_lr = True
+                self.decrease_mpsr_lr = True
 
     def save_best(self, to_log, metric):
         """
@@ -337,7 +329,7 @@ class Trainer(object):
             # save the mapping
             tgt_lang = self.params.tgt_lang
             for src_lang in self.params.src_langs:
-                W = self.mappings[src_lang].weight.data.cpu().numpy()
+                W = self.mappings[src_lang].weight.detach().cpu().numpy()
                 path = os.path.join(self.params.exp_path,
                                     f'best_mapping_{src_lang}2{tgt_lang}.t7')
                 logger.info(f'* Saving the {src_lang} to {tgt_lang} mapping to %s ...' % path)
@@ -355,7 +347,7 @@ class Trainer(object):
             # reload the model
             assert os.path.isfile(path)
             to_reload = torch.from_numpy(torch.load(path))
-            W = self.mappings[src_lang].weight.data
+            W = self.mappings[src_lang].weight.detach()
             assert to_reload.size() == W.size()
             W.copy_(to_reload.type_as(W))
 
@@ -364,12 +356,11 @@ class Trainer(object):
         Export embeddings.
         """
         # export target embeddings
-        tgt_emb = self.embs[self.params.tgt_lang].weight.data
+        tgt_emb = self.embs[self.params.tgt_lang].weight.detach()
         tgt_emb = tgt_emb / tgt_emb.norm(2, 1, keepdim=True).expand_as(tgt_emb)
         export_embeddings(tgt_emb, self.params.tgt_lang, self.params)
         # export all source embeddings
         for src_lang in self.params.src_langs:
             logger.info(f"Map {src_lang} embeddings to the target space ...")
-            src_emb = apply_mapping(self.mappings[src_lang], self.embs[src_lang].weight.data)
-            # src_emb = src_emb / src_emb.norm(2, 1, keepdim=True).expand_as(src_emb)
-            export_embeddings(src_emb.cpu().numpy(), src_lang, self.params)
+            src_emb = apply_mapping(self.mappings[src_lang], self.embs[src_lang].weight.detach())
+            export_embeddings(src_emb, src_lang, self.params)

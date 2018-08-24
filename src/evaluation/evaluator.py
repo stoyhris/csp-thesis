@@ -9,7 +9,7 @@
 from logging import getLogger
 from copy import deepcopy
 import numpy as np
-from torch.autograd import Variable
+import torch
 from torch import Tensor as torch_tensor
 from torch.nn import functional as F
 
@@ -43,7 +43,7 @@ class Evaluator(object):
         for lang in self.params.all_langs:
             ws_scores = get_wordsim_scores(
                 lang, self.vocabs[lang].word2id,
-                apply_mapping(self.mappings[lang], self.embs[lang].weight.detach()).data.cpu().numpy()
+                apply_mapping(self.mappings[lang], self.embs[lang].weight.detach()).cpu().numpy()
             )
             if ws_scores is None:
                 continue
@@ -66,7 +66,7 @@ class Evaluator(object):
         for lang in self.params.all_langs:
             analogy_scores = get_wordanalogy_scores(
                 lang, self.vocabs[lang].word2id,
-                apply_mapping(self.mappings[lang], self.embs[lang].weight.detach()).data.cpu().numpy()
+                apply_mapping(self.mappings[lang], self.embs[lang].weight.detach()).cpu().numpy()
             )
             if analogy_scores is None:
                 continue
@@ -88,10 +88,10 @@ class Evaluator(object):
         if src_lang is None and tgt_lang is None:
             ws_crosslingual_scores = []
             tgt_lang = self.params.tgt_lang
-            tgt_emb = self.embs[tgt_lang].weight.data.cpu().numpy()
+            tgt_emb = self.embs[tgt_lang].weight.detach().cpu().numpy()
             for src_lang in self.params.src_langs:
                 src_emb = apply_mapping(self.mappings[src_lang],
-                        self.embs[src_lang].weight.detach()).data.cpu().numpy()
+                        self.embs[src_lang].weight.detach()).cpu().numpy()
                 # cross-lingual wordsim evaluation
                 ws_scores = get_crosslingual_wordsim_scores(
                     src_lang, self.vocabs[src_lang].word2id, src_emb,
@@ -114,10 +114,10 @@ class Evaluator(object):
             assert src_lang is not None and tgt_lang is not None
             # encode src
             src_emb = apply_mapping(self.mappings[src_lang],
-                    self.embs[src_lang].weight).data.cpu().numpy()
+                    self.embs[src_lang].weight).cpu().numpy()
             # encode tgt
             tgt_emb = apply_mapping(self.mappings[tgt_lang],
-                    self.embs[tgt_lang].weight).data.cpu().numpy()
+                    self.embs[tgt_lang].weight).cpu().numpy()
             # cross-lingual wordsim evaluation
             ws_scores = get_crosslingual_wordsim_scores(
                 src_lang, self.vocabs[src_lang].word2id, src_emb,
@@ -137,12 +137,13 @@ class Evaluator(object):
         """
         # evaluate all src langs to tgt_lang by default
         if src_lang is None and tgt_lang is None:
+            wt_precisions = []
             tgt_lang = self.params.tgt_lang
-            tgt_emb = self.embs[tgt_lang].weight.data
+            tgt_emb = self.embs[tgt_lang].weight.detach()
             for src_lang in self.params.src_langs:
                 # mapped word embeddings
                 src_emb = apply_mapping(self.mappings[src_lang],
-                        self.embs[src_lang].weight.detach()).data
+                        self.embs[src_lang].weight.detach())
 
                 for method in ['nn', 'csls_knn_10']:
                     results = get_word_translation_accuracy(
@@ -153,15 +154,21 @@ class Evaluator(object):
                     if results is None:
                         continue
                     to_log.update([('%s-%s_%s-%s' % (src_lang, tgt_lang, k, method), v) for k, v in results])
+                    if method == 'csls_knn_10':
+                        for k, v in results:
+                            if k == 'precision_at_1':
+                                wt_precisions.append(v)
+            to_log['precision_at_1-csls_knn_10'] = np.mean(wt_precisions)
+            logger.info("word translation precision@1: %.5f" % (np.mean(wt_precisions)))
         else:
             # only evaluate src_lang to tgt_lang; bridge as necessary
             assert src_lang is not None and tgt_lang is not None
             # encode src
             src_emb = apply_mapping(self.mappings[src_lang],
-                    self.embs[src_lang].weight).data.cpu()
+                    self.embs[src_lang].weight).cpu()
             # encode tgt
             tgt_emb = apply_mapping(self.mappings[tgt_lang],
-                    self.embs[tgt_lang].weight).data.cpu()
+                    self.embs[tgt_lang].weight).cpu()
             for method in ['nn', 'csls_knn_10']:
                 results = get_word_translation_accuracy(
                     src_lang, self.vocabs[src_lang].word2id, src_emb,
@@ -205,8 +212,8 @@ class Evaluator(object):
 
                 # mapped word embeddings
                 src_emb = apply_mapping(self.mappings[src_lang],
-                        self.embs[src_lang].weight).data
-                tgt_emb = self.embs[tgt_lang].weight.data
+                        self.embs[src_lang].weight)
+                tgt_emb = self.embs[tgt_lang].weight
 
                 # get idf weights
                 idf = get_idf(self.europarl_data[lang_pair], src_lang, tgt_lang, n_idf=n_idf)
@@ -246,10 +253,10 @@ class Evaluator(object):
                 return
             # encode src
             src_emb = apply_mapping(self.mappings[src_lang],
-                    self.embs[src_lang].weight).data
+                    self.embs[src_lang].weight)
             # encode tgt
             tgt_emb = apply_mapping(self.mappings[tgt_lang],
-                    self.embs[tgt_lang].weight).data
+                    self.embs[tgt_lang].weight)
             # get idf weights
             idf = get_idf(self.europarl_data[lang_pair], src_lang, tgt_lang, n_idf=n_idf)
 
@@ -282,12 +289,12 @@ class Evaluator(object):
         for i, src_lang in enumerate(self.params.src_langs):
             # mapped word embeddings
             src_emb = apply_mapping(self.mappings[src_lang],
-                    self.embs[src_lang].weight).data
+                    self.embs[src_lang].weight)
             src_emb = src_emb / src_emb.norm(2, 1, keepdim=True).expand_as(src_emb)
             for j in range(i+1, len(self.params.all_langs)):
                 tgt_lang = self.params.all_langs[j]
                 tgt_emb = apply_mapping(self.mappings[tgt_lang],
-                        self.embs[tgt_lang].weight).data
+                        self.embs[tgt_lang].weight)
                 tgt_emb = tgt_emb / tgt_emb.norm(2, 1, keepdim=True).expand_as(tgt_emb)
                 # build dictionary
                 # for dico_method in ['nn', 'csls_knn_10']:
@@ -361,29 +368,33 @@ class Evaluator(object):
             real_preds = []
             fake_preds = []
             for i in range(0, self.embs[src_lang].num_embeddings, bs):
-                emb = Variable(self.embs[src_lang].weight[i:i + bs].data, volatile=True)
-                preds = self.discriminators[src_lang](emb)
-                real_preds.extend(preds.data.cpu().tolist())
+                with torch.no_grad():
+                    emb = self.embs[src_lang].weight[i:i + bs].detach()
+                    preds = self.discriminators[src_lang](emb)
+                real_preds.extend(preds.cpu().tolist())
             for i in range(0, self.embs[tgt_lang].num_embeddings, bs):
-                emb = Variable(self.embs[tgt_lang].weight[i:i + bs].data, volatile=True)
-                emb = F.linear(emb, self.mappings[src_lang].weight.t())
-                preds = self.discriminators[src_lang](emb)
-                fake_preds.extend(preds.data.cpu().tolist())
+                with torch.no_grad():
+                    emb = self.embs[tgt_lang].weight[i:i + bs].detach()
+                    emb = F.linear(emb, self.mappings[src_lang].weight.t())
+                    preds = self.discriminators[src_lang](emb)
+                fake_preds.extend(preds.cpu().tolist())
             dis_accus[src_lang] = self.eval_discriminator(to_log, src_lang, real_preds, fake_preds)
 
         # for tgt lang, random sample fake examples from all src langs
         real_preds = []
         fake_preds = []
         for i in range(0, self.embs[tgt_lang].num_embeddings, bs):
-            emb = Variable(self.embs[tgt_lang].weight[i:i + bs].data, volatile=True)
-            preds = self.discriminators[src_lang](emb)
-            real_preds.extend(preds.data.cpu().tolist())
+            with torch.no_grad():
+                emb = self.embs[tgt_lang].weight[i:i + bs].detach()
+                preds = self.discriminators[src_lang](emb)
+            real_preds.extend(preds.cpu().tolist())
         for src_lang in self.params.src_langs:
             # sub-sample
             for i in range(0, self.embs[src_lang].num_embeddings // self.params.src_N, bs):
-                emb = Variable(self.embs[src_lang].weight[i:i + bs].data, volatile=True)
-                preds = self.discriminators[src_lang](self.mappings[src_lang](emb))
-                fake_preds.extend(preds.data.cpu().tolist())
+                with torch.no_grad():
+                    emb = self.embs[src_lang].weight[i:i + bs].detach()
+                    preds = self.discriminators[src_lang](self.mappings[src_lang](emb))
+                fake_preds.extend(preds.cpu().tolist())
         dis_accus[tgt_lang] = self.eval_discriminator(to_log, tgt_lang, real_preds, fake_preds)
 
         avg_dis_accu = np.mean(list(dis_accus.values()))

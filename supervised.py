@@ -32,7 +32,8 @@ parser.add_argument("--verbose", type=int, default=2, help="Verbose level (2:deb
 parser.add_argument("--exp_path", type=str, default="", help="Where to store experiment logs and models")
 parser.add_argument("--exp_name", type=str, default="debug", help="Experiment name")
 parser.add_argument("--exp_id", type=str, default="", help="Experiment ID")
-parser.add_argument("--cuda", type=bool_flag, default=True, help="Run on GPU")
+# parser.add_argument("--cuda", type=bool_flag, default=True, help="Run on GPU")
+parser.add_argument("--device", type=str, default="cuda", help="Run on GPU or CPU")
 parser.add_argument("--export", type=str, default="txt", help="Export embeddings after training (txt / pth)")
 
 # data
@@ -49,7 +50,7 @@ parser.add_argument("--mpsr_optimizer", type=str, default="adam", help="Multilin
 parser.add_argument("--mpsr_orthogonalize", type=bool_flag, default=True, help="During MPSR, whether to perform orthogonalization")
 parser.add_argument("--mpsr_n_steps", type=int, default=30000, help="Number of optimization steps for MPSR")
 # dictionary creation parameters (for refinement)
-parser.add_argument("--dico_train", type=str, default="default", help="Path to training dictionary (default: use identical character strings)")
+parser.add_argument("--dico_train", type=str, default="default", help="Path to training dictionary (default or identical_char)")
 parser.add_argument("--dico_eval", type=str, default="default", help="Path to evaluation dictionary")
 parser.add_argument("--dico_method", type=str, default='csls_knn_10', help="Method used for dictionary generation (nn/invsm_beta_30/csls_knn_10)")
 parser.add_argument("--dico_build", type=str, default='S2T&T2S', help="S2T,T2S,S2T|T2S,S2T&T2S")
@@ -79,7 +80,7 @@ if len(params.tgt_emb) == 0:
     params.tgt_emb = os.path.join(EMB_DIR, f'wiki.{params.tgt_lang}.vec')
 
 # check parameters
-assert not params.cuda or torch.cuda.is_available()
+assert not params.device.lower().startswith('cuda') or torch.cuda.is_available()
 assert params.dico_train in ["identical_char", "default"] or os.path.isfile(params.dico_train)
 assert params.dico_build in ["S2T", "T2S", "S2T|T2S", "S2T&T2S"]
 assert params.dico_max_size == 0 or params.dico_max_size < params.dico_max_rank
