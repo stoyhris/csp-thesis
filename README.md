@@ -1,14 +1,14 @@
 ## Unsupervise Multilingual Word Embeddings
 This repo contains the source code for our paper:
 
-[**Unsupervised Multilingual Word Embeddings**]()
+[**Unsupervised Multilingual Word Embeddings**](https://arxiv.org/abs/1808.08933)
 <br>
 [Xilun Chen](http://www.cs.cornell.edu/~xlchen/),
 [Claire Cardie](http://www.cs.cornell.edu/home/cardie/)
 <br>
 EMNLP 2018
 <br>
-[paper](),
+[paper](https://arxiv.org/abs/1808.08933),
 [bibtex]()
 
 
