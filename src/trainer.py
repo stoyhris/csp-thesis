@@ -355,12 +355,19 @@ class Trainer(object):
         """
         Export embeddings.
         """
+        params = self.params
+        # load all embeddings
+        logger.info("Reloading embeddings for mapping ...")
+        params.vocabs[params.tgt_lang], tgt_emb = load_embeddings(params, params.tgt_lang,
+                params.tgt_emb, full_vocab=True)
+        normalize_embeddings(tgt_emb, params.normalize_embeddings,
+                mean=params.lang_mean[params.tgt_lang])
         # export target embeddings
-        tgt_emb = self.embs[self.params.tgt_lang].weight.detach()
-        tgt_emb = tgt_emb / tgt_emb.norm(2, 1, keepdim=True).expand_as(tgt_emb)
         export_embeddings(tgt_emb, self.params.tgt_lang, self.params)
         # export all source embeddings
-        for src_lang in self.params.src_langs:
+        for i, src_lang in enumerate(self.params.src_langs):
+            params.vocabs[src_lang], src_emb = load_embeddings(params, src_lang,
+                    params.src_embs[i], full_vocab=True)
             logger.info(f"Map {src_lang} embeddings to the target space ...")
-            src_emb = apply_mapping(self.mappings[src_lang], self.embs[src_lang].weight.detach())
+            src_emb = apply_mapping(self.mappings[src_lang], src_emb)
             export_embeddings(src_emb, src_lang, self.params)

@@ -89,7 +89,8 @@ def build_model(params, with_dis):
             discriminators[lang] = discriminators[lang].to(params.device)
 
     # normalize embeddings
+    params.lang_mean = {}
     for lang, emb in embs.items():
-        normalize_embeddings(emb.weight.detach(), params.normalize_embeddings)
+        params.lang_mean[lang] = normalize_embeddings(emb.weight.detach(), params.normalize_embeddings)
 
     return embs, mappings, discriminators

@@ -429,7 +429,7 @@ def export_embeddings(emb, lang, params):
     assert params.export in ["txt", "pth"]
 
     vocab = params.vocabs[lang]
-    path = os.path.join(params.exp_path, 'vectors-%s.txt' % lang)
+    path = os.path.join(params.exp_path, 'vectors-%s.%s' % (lang, params.export))
     logger.info('Writing embeddings to %s ...' % path)
     # text file
     if params.export == "txt":
@@ -449,5 +449,5 @@ def apply_mapping(mapping, input_emb):
         output_emb = input_emb.clone()
         for i, k in enumerate(range(0, len(input_emb), bs)):
             x = input_emb[k:k + bs]
-            output_emb[k:k + bs] = mapping(x.to(mapping.weight.device))
+            output_emb[k:k + bs] = mapping(x.to(mapping.weight.device)).to(input_emb.device)
         return output_emb
