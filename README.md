@@ -11,6 +11,7 @@ EMNLP 2018
 [paper](https://arxiv.org/abs/1808.08933),
 [bibtex]()
 
+![Highlight](http://www.cs.cornell.edu/~xlchen/assets/images/umwe_highlight.png)
 
 ## Dependencies
 * Python 3.6 with [NumPy](http://www.numpy.org/)/[SciPy](https://www.scipy.org/)
