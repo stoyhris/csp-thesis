@@ -70,8 +70,8 @@ def get_sent_translation_accuracy(data, lg1, word2id1, emb1, lg2, word2id2, emb2
     sentence translation accuracy using the precision@k.
     """
     # get word vectors dictionaries
-    emb1 = emb1.cpu().numpy()
-    emb2 = emb2.cpu().numpy()
+    emb1 = emb1.cpu().detach().numpy()
+    emb2 = emb2.cpu().detach().numpy()
     word_vec1 = dict([(w, emb1[word2id1[w]]) for w in word2id1])
     word_vec2 = dict([(w, emb2[word2id2[w]]) for w in word2id2])
     word_vect = {lg1: word_vec1, lg2: word_vec2}
