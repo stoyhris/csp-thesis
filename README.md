@@ -1,4 +1,4 @@
-## Unsupervise Multilingual Word Embeddings
+## Unsupervised Multilingual Word Embeddings
 This repo contains the source code for our paper:
 
 [**Unsupervised Multilingual Word Embeddings**](http://aclweb.org/anthology/D18-1024)
